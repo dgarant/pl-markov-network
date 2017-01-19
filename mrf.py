@@ -1,3 +1,4 @@
+import sys
 import numpy as np
 import scipy as sp
 from scipy import misc as spmisc
@@ -27,18 +28,52 @@ class PotentialFunction(object):
         """ Retrieves the set of variables used by the potential function """
         pass
 
-class ProductPotential(PotentialFunction):
-    def __init__(self, variables):
+class GaussianPotential(PotentialFunction):
+    """ exp(-(v1 - v2)^2 / bandwidth) """
+
+    def __init__(self, variables, bandwidth=None, samples=None, location=None):
         self.var_list = list(variables)
+        self.location = location
+
+        if not len(self.var_list) in [1, 2]:
+            raise ValueError("The Gaussian product potential function does not support {0}-cliques.".format(len(self.var_list)))
+        if len(self.var_list) == 1 and self.location is None:
+            raise ValueError("The location parameter must be specified for univariate Gaussian potentials.")
+
+        if bandwidth is None and samples is None:
+            raise ValueError("One of 'bandwidth' or 'samples' " + 
+                "(used to estimate bandwidth by rule-of-thumb) must be supplied.")
+        elif not bandwidth is None:
+            self.bandwidth = bandwidth
+        else:
+            # estimate bandwidth via Silverman's rule
+            if len(self.var_list) == 2:
+                sd = np.std(samples[self.var_list[0]] - samples[self.var_list[1]])
+            else:
+                sd = np.std(samples[self.var_list[0]] - self.location)
+            npoints = len(samples[self.var_list[0]])
+            self.bandwidth = 2.34 * sd * np.power(npoints, -1.0 / 5.6)
 
     def variables(self):
         return self.var_list
     
     def __call__(self, dmap):
-        running = dmap[self.var_list[0]]
-        for v in self.var_list[1:]:
-            running = np.multiply(running, dmap[v])
-        return running
+        if len(self.var_list) == 1:
+            return np.exp(-np.abs(dmap[self.var_list[0]] - self.location) / self.bandwidth)
+        else:
+            return np.exp(-np.abs(dmap[self.var_list[0]] - dmap[self.var_list[1]]) / self.bandwidth)
+
+class IdentityPotential(PotentialFunction):
+    def __init__(self, variables):
+        self.var_list = list(variables)
+        if len(self.var_list) != 1:
+            raise ValueError("The identity potential function can only be used as a node potential.")
+
+    def variables(self):
+        return self.var_list
+
+    def __call__(self, dmap):
+        return dmap[self.var_list[0]]
 
 class BinaryProductPotential(PotentialFunction):
     def __init__(self, variables):
@@ -60,7 +95,7 @@ class BinaryProductPotential(PotentialFunction):
             return ((vals1 - 1) + vals1) * ((vals2 - 1) + vals2)
 
 class KernelDensityPotential(PotentialFunction):
-    def __init__(self, dmap, variables):
+    def __init__(self, variables, samples):
         """
             Creates the kernel density estimate potential function
             
@@ -71,30 +106,30 @@ class KernelDensityPotential(PotentialFunction):
                      Iterable of variables participating in the potential
         """
         self.var_list = list(variables)
-        self.kde = stats.gaussian_kde(np.array((dmap[v] for v in self.var_list)))
+        if not len(self.var_list) in [1, 2]:
+            raise ValueError("The binary product potential function does not support {0}-cliques.".format(len(self.var_list)))
+        data = np.array([samples[v] for v in self.var_list])
+        self.kde = stats.gaussian_kde(data.flatten() if len(self.var_list) == 1 else data)
 
     def variables(self):
         return self.var_list
 
     def __call__(self, dmap):
         """ Evaluates the potential function at a set of points """
-        return self.kde(np.array((dmap[v] for v in self.var_list)))
+        data = np.array([dmap[v] for v in self.var_list])
+        return self.kde(data.flatten() if len(self.var_list) == 1 else data)
 
 class VariableDef(object):
     def __init__(self, name, ddomain=None, samples=None):
         self.name = name
         self.ddomain = ddomain
-        self.samples = samples
         if ddomain is None and samples is None:
-            raise ValueError("One of ddomain (the discrete domain) or samples " + 
-                "(for continuous variables) must be supplied.")
+            raise ValueError("For discrete data, you should supply 'ddomain'. " + 
+                "For continuous data, you should supply 'samples'.")
+        if not samples is None:
+            self.int_points = stats.mstats.mquantiles(samples, np.linspace(0, 1, 50))
 
-    def icdf(self, q):
-        if self.ddomain:
-            raise ValueError("Empirical CDF is undefined for variables with a discrete domain.")
-        return stats.mstats.mquantiles(self.samples, q)
-
-class MarkovNetwork(object):
+class LogLinearMarkovNetwork(object):
     
     def __init__(self, potential_funs, variable_spec):
         """
@@ -148,6 +183,11 @@ class MarkovNetwork(object):
         if not initweights:
             initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
         data_potentials = self.potentials(dmap)
+        # make sure the data's all discrete
+        for v in self.variable_spec:
+            if v.ddomain is None:
+                raise ValueError("Maximum likelihood estimation only supported for discrete data.")
+
         all_combos =  self.expand_joint(self.variable_spec)
         all_potentials = self.potentials(all_combos)
 
@@ -155,62 +195,63 @@ class MarkovNetwork(object):
             self.mle_objective_and_grad(dmap, weights, 
                 data_potentials=data_potentials, all_potentials=all_potentials), initweights, jac=True)
 
-    def mple_optimize(self, dmap, initweights=None, jac=True):
+    def mple_optimize(self, dmap, initweights=None):
         if not initweights:
             initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
         data_potentials = self.potentials(dmap)
+        local_pots = self.get_local_partition_potentials(dmap)
 
-        if jac:
-            return spoptim.minimize(lambda weights: 
-                self.mple_objective_and_grad(dmap, weights, 
-                    data_potentials=data_potentials), initweights, jac=True)
-        else:
-            return spoptim.minimize(lambda weights: 
-                self.mple_objective_and_grad(dmap, weights, 
-                    data_potentials=data_potentials)[0], initweights, jac=False)
+        return spoptim.minimize(lambda weights: 
+            self.mple_objective_and_grad(dmap, weights, 
+                data_potentials=data_potentials, 
+                local_partition_potentials=local_pots), initweights, jac=True)
 
-    def mple_local_partition_and_expected_potentials(self, dmap, vindex, weights):
+    def mple_local_partition_and_expected_potentials(self, dmap, vindex, weights, local_partition_potentials):
         """ Creates the local pseudo-likelihood partition function for a given variable """
         var = self.variable_spec[vindex]
         npoints = len(dmap.itervalues().next())
         mask = np.array(self.factor_adjacency[vindex, :].todense()).transpose()
-
-        def calc_potentials(val):
-            dmap_prime = dict([(v.name, dmap[v.name]) 
-                if i != vindex else (v.name, np.repeat(val, npoints)) for i, v in enumerate(self.variable_spec)])
-            return self.potentials(dmap_prime)
+        all_potentials = local_partition_potentials[var.name]
+        weighted_potentials = np.dot(weights, np.multiply(mask, all_potentials))
 
         if not var.ddomain is None: # discrete
-            all_potentials = np.array([calc_potentials(v) for v in var.ddomain])
-            weighted_potentials = np.dot(weights, np.multiply(mask, all_potentials))
             all_probs = np.divide(np.exp(weighted_potentials), np.sum(np.exp(weighted_potentials), axis=0))
             local_partition = spmisc.logsumexp(weighted_potentials, axis=0)
             expected_pots_given_params = np.sum(np.multiply(all_probs[:, np.newaxis, :], all_potentials), axis=0)
         else:
-            eval_points = var.icdf(np.linspace(0, 1, 20))
-            all_potentials = np.array([calc_potentials(v) for v in eval_points])
-            weighted_potentials = np.dot(weights, np.multiply(mask, all_potentials))
-
-            normalizer = sp.integrate.trapz(np.exp(weighted_potentials), eval_points, axis=0)
-
-            all_densities = np.divide(np.exp(weighted_potentials), normalizer) # densities, not masses
-            expected_pots_given_params = sp.integrate.trapz(np.multiply(all_densities[:, np.newaxis, :], all_potentials), eval_points, axis=0)
+            normalizer = sp.integrate.trapz(np.exp(weighted_potentials), var.int_points, axis=0)
+            all_densities = np.divide(np.exp(weighted_potentials), normalizer)
+            expected_pots_given_params = sp.integrate.trapz(np.multiply(all_densities[:, np.newaxis, :], all_potentials), var.int_points, axis=0)
             local_partition = np.log(normalizer)
 
         return (local_partition, expected_pots_given_params)
 
-    def mple_objective_and_grad(self, dmap, weights, data_potentials=None):
+    def get_local_partition_potentials(self, dmap):
+        npoints = len(dmap.itervalues().next())
+
+        def calc_potentials(vindex, val):
+            dmap_prime = dict([(v.name, dmap[v.name]) 
+                if i != vindex else (v.name, np.repeat(val, npoints)) for i, v in enumerate(self.variable_spec)])
+            return self.potentials(dmap_prime)
+
+        local_partition_potentials = dict()
+        for vindex, v in enumerate(self.variable_spec):
+            if not v.ddomain is None:
+                local_partition_potentials[v.name] = np.array([calc_potentials(vindex, val) for val in v.ddomain])
+            else:
+                local_partition_potentials[v.name] = np.array([calc_potentials(vindex, val) for val in v.int_points])
+        return local_partition_potentials
+
+    def mple_objective_and_grad(self, dmap, weights, data_potentials=None, local_partition_potentials=None):
         # Objective function (negative log-pseudo-likelihood) and gradient for 
         # MRF maximum pseudo-likelihood estimation
 
         npoints = len(dmap.itervalues().next())
-        def gen_configs(vname, val):
-            # gets terms for the summation over configurations of a single variable
-            return dict([(v.name, dmap[v.name]) 
-                if v.name != vname else (v.name, np.repeat(val, npoints)) for v in self.variable_spec])
 
         if data_potentials is None:
             data_potentials = self.potentials(dmap)
+        if local_partition_potentials is None:
+            local_partition_potentials = self.get_local_partition_potentials(dmap)
 
         ll_terms = []
         grad_terms = []
@@ -220,7 +261,8 @@ class MarkovNetwork(object):
             masked_dpots = np.multiply(mask, data_potentials)
             data_term = np.dot(weights, masked_dpots)
 
-            local_partition, expected_pots_given_params = self.mple_local_partition_and_expected_potentials(dmap, vindex, weights)
+            local_partition, expected_pots_given_params = self.mple_local_partition_and_expected_potentials(
+                dmap, vindex, weights, local_partition_potentials)
             assert(expected_pots_given_params.shape == (len(weights), npoints))
 
             ll_terms.append(data_term - local_partition)
@@ -240,23 +282,21 @@ class MarkovNetwork(object):
 
         return np.exp(np.dot(weights, data_potentials)) / np.exp(np.dot(weights, all_potentials)).sum()
 
-    def normalized_pll_prob(self, dmap, weights):
-        data_potentials = self.potentials(dmap)
-        all_combos =  self.expand_joint(self.variable_spec)
-        all_potentials = self.potentials(all_combos)
-        return np.exp(np.dot(weights, data_potentials)) / np.exp(np.dot(weights, all_potentials)).sum()
+    def pseudonormalized_prob(self, dmap, weights):
 
-    def normalized_pll_density(self, dmap, weights):
+        local_partition_potentials = self.get_local_partition_potentials(dmap)
+
         data_potentials = self.potentials(dmap)
-        #print(data_potentials)
-        densities = np.zeros(len(dmap.itervalues().next()))
+        probs = np.zeros(len(dmap.itervalues().next()))
         for vindex, var in enumerate(self.variable_spec):
             mask = np.array(self.factor_adjacency[vindex, :].todense()).transpose()
             masked_dpots = np.multiply(mask, data_potentials)
             weighted_dpots = np.dot(weights, masked_dpots)
-            local_partition, expected_pots_given_params = self.mple_local_partition_and_expected_potentials(dmap, vindex, weights)
-            densities = densities + (np.exp(np.sum(masked_dpots, axis=0)) / np.exp(local_partition))
-        return densities
+            local_partition, expected_pots_given_params = self.mple_local_partition_and_expected_potentials(
+                    dmap, vindex, weights, local_partition_potentials)
+            probs = probs + weighted_dpots - local_partition
+
+        return np.exp(probs)
 
     def potentials(self, dmap):
         return np.array([f(dmap) for f in self.potential_funs])
@@ -265,105 +305,3 @@ class MarkovNetwork(object):
         """ Creates a data map which specifies the joint assignments of all variables """
         grid = np.meshgrid(*(a.ddomain for a in variable_spec))
         return dict([(variable_spec[i].name, e.flatten()) for i, e in enumerate(grid)])
-
-def binary_demo():
-    nsamp = 1000
-    x1 = np.random.binomial(1, 0.5, nsamp)
-    y1 = np.random.binomial(1, x1 * 0.8 + (1 - x1) * 0.2, nsamp)
-
-    x2 = np.random.binomial(1, 0.5, nsamp)
-    y2 = np.random.binomial(1, x2 * 0.8 + (1 - x2) * 0.2, nsamp)
-
-    var_defs = [
-        VariableDef("x1", ddomain=[0, 1]),
-        VariableDef("x2", ddomain=[0, 1]),
-        VariableDef("y1", ddomain=[0, 1]),
-        VariableDef("y2", ddomain=[0, 1])
-    ]
-
-    potentials = [
-        BinaryProductPotential(["x1", "y1"]),
-        BinaryProductPotential(["x2", "y2"]),
-        BinaryProductPotential(["y1", "y2"]),
-        BinaryProductPotential(["y1"]),
-        BinaryProductPotential(["y2"])
-    ]
-
-    data = {
-        "x1" : x1,
-        "x2" : x2,
-        "y1" : y1,
-        "y2" : y2,
-    }
-
-    network = MarkovNetwork(potentials, var_defs)
-
-    all_combos = network.expand_joint(var_defs)
-    x1p, x2p, y1p, y2p = (all_combos["x1"], all_combos["x2"], all_combos["y1"], all_combos["y2"])
-    true_probs= ((0.5) * (0.5) * 
-        ((y1p == x1p) * 0.8 + (1 - (y1p == x1p)) * 0.2) * 
-        ((y2p == x2p) * 0.8 + (1 - (y2p == x2p)) * 0.2)
-        )
-
-    np.set_printoptions(suppress=True)
-    mle_result = network.mle_optimize(data)
-    mle_probs = network.normalized_prob(all_combos, mle_result.x)
-
-    print("-----------------------")
-    print("MLE result:")
-    print("-----------------------")
-    print(mle_result)
-
-    mple_result = network.mple_optimize(data)
-    mple_probs = network.normalized_pll_prob(all_combos, mple_result.x)
-
-    print("-----------------------")
-    print("MPLE result:")
-    print("-----------------------")
-    print(mple_result)
-
-    print(np.column_stack((mle_probs, mple_probs, x1p, x2p, y1p, y2p, true_probs)))
-
-def gaussian_demo():
-    nsamp = 10
-    x1 = np.random.normal(size=nsamp)
-    y1 = np.random.normal(loc=x1)
-
-    x2 = np.random.normal(size=nsamp)
-    y2 = np.random.normal(loc=x1)
-
-    var_defs = [
-        VariableDef("x1", samples=x1),
-        VariableDef("x2", samples=x2),
-        VariableDef("y1", samples=y1),
-        VariableDef("y2", samples=y2)
-    ]
-
-    potentials = [
-        ProductPotential(["x1", "y1"]),
-        ProductPotential(["x2", "y2"]),
-        ProductPotential(["y1", "y2"]),
-        ProductPotential(["y1"]),
-        ProductPotential(["y2"])
-    ]
-
-    data = {
-        "x1" : x1,
-        "x2" : x2,
-        "y1" : y1,
-        "y2" : y2,
-    }
-
-    network = MarkovNetwork(potentials, var_defs)
-    mple_result = network.mple_optimize(data)
-    print(mple_result)
-    density = network.normalized_pll_density(data, mple_result.x)
-    np.set_printoptions(suppress=True)
-    print(np.column_stack((x1, x2, y1, y2, density)))
-
-def main():
-    #binary_demo()
-    gaussian_demo()
-    
-if __name__ == "__main__":
-    main()
