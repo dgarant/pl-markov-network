@@ -8,12 +8,12 @@ data = {"x" : x}
 potential = GaussianPotential(["x"], samples=data, location=0)
 network = LogLinearMarkovNetwork([potential],
                                  [VariableDef("x", samples=x)])
-mple_result = network.mple_optimize(data)
+mple_result = network.fit(data)
 print("MPLE optimization result:")
 print(mple_result)
 
 xp = np.linspace(np.min(x), np.max(x), 100)
-density = network.pseudonormalized_prob({"x" : xp}, mple_result.x)
+density = network.pseudonormalized_prob({"x" : xp})
 true_density = sp.stats.norm.pdf(xp)
 np.set_printoptions(suppress=True)
 potentials = network.potentials({"x" : xp}).flatten()

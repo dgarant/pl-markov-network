@@ -4,6 +4,7 @@ import scipy as sp
 from scipy import misc as spmisc
 from scipy import optimize as spoptim
 from scipy import stats
+from scipy import interpolate as spinterp
 from scipy import sparse as spsparse
 from sklearn.metrics import matthews_corrcoef
 import matplotlib.pyplot as plt
@@ -179,7 +180,7 @@ class LogLinearMarkovNetwork(object):
 
         return (np.sum(npoints * partition) - np.sum(numerator), grad)
 
-    def mle_optimize(self, dmap, initweights=None):
+    def fit_mle(self, dmap, initweights=None):
         if not initweights:
             initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
         data_potentials = self.potentials(dmap)
@@ -191,20 +192,24 @@ class LogLinearMarkovNetwork(object):
         all_combos =  self.expand_joint(self.variable_spec)
         all_potentials = self.potentials(all_combos)
 
-        return spoptim.minimize(lambda weights: 
+        result = spoptim.minimize(lambda weights: 
             self.mle_objective_and_grad(dmap, weights, 
                 data_potentials=data_potentials, all_potentials=all_potentials), initweights, jac=True)
+        self.weights = result.x
+        return result
 
-    def mple_optimize(self, dmap, initweights=None):
+    def fit(self, dmap, initweights=None):
         if not initweights:
             initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
         data_potentials = self.potentials(dmap)
         local_pots = self.get_local_partition_potentials(dmap)
 
-        return spoptim.minimize(lambda weights: 
+        result = spoptim.minimize(lambda weights: 
             self.mple_objective_and_grad(dmap, weights, 
                 data_potentials=data_potentials, 
                 local_partition_potentials=local_pots), initweights, jac=True)
+        self.weights = result.x
+        return result
 
     def mple_local_partition_and_expected_potentials(self, dmap, vindex, weights, local_partition_potentials):
         """ Creates the local pseudo-likelihood partition function for a given variable """
@@ -218,13 +223,13 @@ class LogLinearMarkovNetwork(object):
             all_probs = np.divide(np.exp(weighted_potentials), np.sum(np.exp(weighted_potentials), axis=0))
             local_partition = spmisc.logsumexp(weighted_potentials, axis=0)
             expected_pots_given_params = np.sum(np.multiply(all_probs[:, np.newaxis, :], all_potentials), axis=0)
+            return (local_partition, expected_pots_given_params, all_probs)
         else:
             normalizer = sp.integrate.trapz(np.exp(weighted_potentials), var.int_points, axis=0)
             all_densities = np.divide(np.exp(weighted_potentials), normalizer)
             expected_pots_given_params = sp.integrate.trapz(np.multiply(all_densities[:, np.newaxis, :], all_potentials), var.int_points, axis=0)
             local_partition = np.log(normalizer)
-
-        return (local_partition, expected_pots_given_params)
+            return (local_partition, expected_pots_given_params, all_densities)
 
     def get_local_partition_potentials(self, dmap):
         npoints = len(dmap.itervalues().next())
@@ -261,7 +266,7 @@ class LogLinearMarkovNetwork(object):
             masked_dpots = np.multiply(mask, data_potentials)
             data_term = np.dot(weights, masked_dpots)
 
-            local_partition, expected_pots_given_params = self.mple_local_partition_and_expected_potentials(
+            local_partition, expected_pots_given_params, _ = self.mple_local_partition_and_expected_potentials(
                 dmap, vindex, weights, local_partition_potentials)
             assert(expected_pots_given_params.shape == (len(weights), npoints))
 
@@ -275,14 +280,56 @@ class LogLinearMarkovNetwork(object):
 
         return (- (1.0 / npoints) * np.sum(ll_terms), np.sum(grad_terms, axis=0))
 
-    def normalized_prob(self, dmap, weights):
+    def normalized_prob(self, dmap, weights=None):
+        if weights is None and self.weights is None:
+            raise ValueError("The network parameters must be fit before computing probabilities")
+        elif weights is None:
+            weights = self.weights
+
         data_potentials = self.potentials(dmap)
         all_combos =  self.expand_joint(self.variable_spec)
         all_potentials = self.potentials(all_combos)
 
         return np.exp(np.dot(weights, data_potentials)) / np.exp(np.dot(weights, all_potentials)).sum()
 
-    def pseudonormalized_prob(self, dmap, weights):
+    def unnormalized_prob(self, dmap, weights):
+        if weights is None and self.weights is None:
+            raise ValueError("The network parameters must be fit before computing probabilities")
+
+        data_potentials = self.potentials(dmap)
+        return np.exp(np.dot(weights, data_potentials))
+
+    def gibbs_sample(self, last_state, weights=None):
+        if weights is None and self.weights is None:
+            raise ValueError("The network parameters must be fit before running Gibbs sampling")
+        elif weights is None:
+            weights = self.weights
+
+        all_potentials = self.get_local_partition_potentials(last_state)
+
+        next_state = dict()
+        for vindex, var in enumerate(self.variable_spec):
+            _, _, probs = self.mple_local_partition_and_expected_potentials(
+                    last_state, vindex, weights, all_potentials)
+            if not var.ddomain is None:
+                next_state[var.name] = np.apply_along_axis(lambda row: np.random.choice(var.ddomain, p=row), 0, probs)
+            else:
+                # getting inverse cdf
+                cum_points = sp.integrate.cumtrapz(probs, var.int_points, axis=0, initial=0)
+                # since numeric integration sometimes yields slightly more or less than unit area:
+                cum_points[-1, :] = np.repeat(1, probs.shape[1])
+                def sample_cdf(cdf_vals):
+                    interpolator = spinterp.interp1d(cdf_vals, var.int_points)
+                    return interpolator(np.random.uniform())
+                next_state[var.name] = np.apply_along_axis(sample_cdf, 0, cum_points)
+
+        return next_state
+
+    def pseudonormalized_prob(self, dmap, weights=None):
+        if weights is None and self.weights is None:
+            raise ValueError("The network parameters must be fit before computing pseudo-probabilities")
+        elif weights is None:
+            weights = self.weights
 
         local_partition_potentials = self.get_local_partition_potentials(dmap)
 
@@ -292,7 +339,7 @@ class LogLinearMarkovNetwork(object):
             mask = np.array(self.factor_adjacency[vindex, :].todense()).transpose()
             masked_dpots = np.multiply(mask, data_potentials)
             weighted_dpots = np.dot(weights, masked_dpots)
-            local_partition, expected_pots_given_params = self.mple_local_partition_and_expected_potentials(
+            local_partition, expected_pots_given_params, _ = self.mple_local_partition_and_expected_potentials(
                     dmap, vindex, weights, local_partition_potentials)
             probs = probs + weighted_dpots - local_partition
 
@@ -305,3 +352,4 @@ class LogLinearMarkovNetwork(object):
         """ Creates a data map which specifies the joint assignments of all variables """
         grid = np.meshgrid(*(a.ddomain for a in variable_spec))
         return dict([(variable_spec[i].name, e.flatten()) for i, e in enumerate(grid)])
+

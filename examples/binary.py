@@ -41,17 +41,17 @@ true_probs= ((0.5) * (0.5) *
     )
 
 np.set_printoptions(suppress=True)
-mle_result = network.mle_optimize(data)
-mle_probs = network.normalized_prob(all_combos, mle_result.x)
+mle_result = network.fit_mle(data)
+mle_probs = network.normalized_prob(all_combos)
 
 print("-----------------------")
 print("MLE result:")
 print("-----------------------")
 print(mle_result)
 
-mple_result = network.mple_optimize(data)
-mple_probs = network.normalized_prob(all_combos, mple_result.x)
-mple_pseudo_probs = network.pseudonormalized_prob(all_combos, mple_result.x)
+mple_result = network.fit(data)
+mple_probs = network.normalized_prob(all_combos)
+mple_pseudo_probs = network.pseudonormalized_prob(all_combos)
 
 print("-----------------------")
 print("MPLE result:")

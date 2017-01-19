@@ -31,7 +31,7 @@ potentials = [
 ]
 
 network = LogLinearMarkovNetwork(potentials, var_defs)
-mple_result = network.mple_optimize(data)
+mple_result = network.fit(data)
 print("MPLE optimization result:")
 print(mple_result)
 
@@ -56,7 +56,7 @@ trueish_density = sp.stats.multivariate_normal.pdf(
     np.array([x1p, x2p, y1p, y2p]).T, mean=true_mean, cov=true_covariance)
 
 print("\n")
-density = network.pseudonormalized_prob(new_data, mple_result.x)
+density = network.pseudonormalized_prob(new_data)
 results = np.column_stack((density, trueish_density, new_data["x1"], new_data["x2"], new_data["y1"], new_data["y2"]))
 np.savetxt(sys.stdout, results, fmt="%.3f", delimiter="\t", 
     header=", ".join(["MPLE Pseudo-density", "True(ish) Density", "X1", "X2", "Y1", "Y2"]))
