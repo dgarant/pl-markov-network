@@ -7,11 +7,11 @@ except ImportError:
 
 import mrf
 
-setup(name='pll_markov_network',
+setup(name='plmrf',
       version='1.0',
       author='Dan Garant',
-      url='https://github.com/dgarant/pll-markov-network',
+      url='https://github.com/dgarant/pl-markov-network',
       license='MIT',
-      py_modules=['mrf']
+      py_modules=['plmrf']
      )
 

@@ -1,4 +1,4 @@
-from mrf import *
+from plmrf import *
 import numpy as np
 
 
