@@ -262,7 +262,7 @@ class LogLinearMarkovNetwork(object):
         weighted_potentials = np.dot(weights[mask], all_potentials)
 
         if not var.ddomain is None: # discrete
-            all_probs = np.divide(np.exp(weighted_potentials), np.sum(np.exp(weighted_potentials), axis=0))
+            all_probs = np.exp(weighted_potentials - np.logsumexp(weighted_potentials, axis=0))
             local_partition = spmisc.logsumexp(weighted_potentials, axis=0)
             expected_pots_given_params = np.sum(np.multiply(all_probs[:, np.newaxis, :], all_potentials), axis=0)
             return (local_partition, expected_pots_given_params, all_probs)
