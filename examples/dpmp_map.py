@@ -41,26 +41,41 @@ mple_result = network.fit(data)
 print("Learned weights:")
 print(mple_result.x)
 
-node_potentials = {"y1" : potentials[3], "y2" : potentials[4], "x1" : potentials[5], "x2" : potentials[6]}
+node_potentials = {"y1" : potentials[3], "y2" : potentials[4], 
+                   "x1" : potentials[5], "x2" : potentials[6]}
 edge_potentials = {("x1", "y1") : potentials[0], ("x2", "y2") : potentials[1],
                    ("y1", "y2") : potentials[2]}
+
+weights = mple_result.x
+weight_dict = {"x1" : weights[5],
+               "x2" : weights[6],
+               "y1" : weights[3],
+               "y2" : weights[4],
+               ("x1", "y1") : weights[0],
+               ("x2", "y2") : weights[1],
+               ("y1", "y2") : weights[2]}
+
 def node_pot(s, vs):
-    return node_potentials[s]({s : vs})
+    val = node_potentials[s]({s : vs}) * weight_dict[s]
+    return val
 def edge_pot(s, t, vs, vt):
-    return edge_potentials[(s, t)]({s: vs, t: vt})
+    return edge_potentials[(s, t)]({s: vs, t: vt}) * weight_dict[(s, t)]
 
 
 dpmp_network = pyDPMP.mrf.MRF(["x1", "x2", "y1", "y2"],
                               [("x1", "y1"), ("x2", "y2"), ("y1", "y2")],
                               node_pot, edge_pot)
 proposal = pyDPMP.proposals.random_walk_proposal_1d(1)
-initial_particles = {"x1" : [1.0], "x2" : [1.0], "y1" : [1.0], "y2" : [1.0]}
+initial_particles = {"x1" : np.random.normal(size=20), 
+                     "x2" : np.random.normal(size=20), 
+                     "y1" : np.random.normal(size=20), 
+                     "y2" : np.random.normal(size=20)}
 xMAP, xParticles, stats = pyDPMP.DPMP_infer(dpmp_network, initial_particles,
-                                     50, # num paricles
+                                     20, # num paricles
                                      proposal,
                                      pyDPMP.particleselection.SelectDiverse(),
                                      pyDPMP.messagepassing.MaxSumMP(dpmp_network),
                                      conv_tol=None,
-                                     max_iters=100)
+                                     max_iters=10)
 print("Estimated MAP state (true state is {x1: 1,  y1: 1.5, y2: 0, x2: 0})")
 print(xMAP)
