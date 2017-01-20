@@ -1,6 +1,9 @@
+# Demonstrates parameter estimation for small discrete systems using
+# MLE as well as MPLE, and compares the quality of the weights using the 
+# true probability mass of each assignment as a reference.
+
 from plmrf import *
 import numpy as np
-
 
 nsamp = 1000
 x1 = np.random.binomial(1, 0.5, nsamp)
