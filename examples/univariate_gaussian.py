@@ -1,3 +1,5 @@
+# Demonstrates density estimation using the pseudo-density approximation
+
 from plmrf import *
 import numpy as np
 

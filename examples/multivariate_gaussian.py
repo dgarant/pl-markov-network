@@ -1,3 +1,5 @@
+# Demonstrates parameter estimation and Gibbs sampling for a multivariate Gaussian
+
 from plmrf import *
 import numpy as np
 
@@ -47,16 +49,11 @@ new_data = {
     "y2" : y2p
 }
 
-true_covariance = np.array([[1, 0, 1, 0], 
-                           [0, 1, 0, 1],
-                           [1, 0, 2, 0],
-                           [0, 1, 0, 2]])
-true_mean = np.array([0, 0, 0, 0])
-trueish_density = sp.stats.multivariate_normal.pdf(
-    np.array([x1p, x2p, y1p, y2p]).T, mean=true_mean, cov=true_covariance)
-
 print("\n")
-density = network.pseudonormalized_prob(new_data)
-results = np.column_stack((density, trueish_density, new_data["x1"], new_data["x2"], new_data["y1"], new_data["y2"]))
-np.savetxt(sys.stdout, results, fmt="%.3f", delimiter="\t", 
-    header=", ".join(["MPLE Pseudo-density", "True(ish) Density", "X1", "X2", "Y1", "Y2"]))
+var_order = ["x1", "x2", "y1", "y2"]
+cur_state = {"x1" : np.array([0]), "x2" : np.array([0]), 
+             "y1" : np.array([0]), "y2" : np.array([0])}
+print("\nGibbs sampling from {0}".format([cur_state[v][0] for v in var_order]))
+for i in range(20):
+    cur_state = network.gibbs_sample(cur_state)
+    print("Sample {0} state: {1}".format(i+1, [cur_state[v][0] for v in var_order]))
