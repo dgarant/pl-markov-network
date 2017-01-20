@@ -154,13 +154,10 @@ class LogLinearMarkovNetwork(object):
         self.factor_adjacency = spsparse.csr_matrix((np.repeat(1, len(adj_rows)), (adj_rows, adj_cols)))
 
     def mle_objective_and_grad(self, dmap, weights, data_potentials=None, all_potentials=None):
-        # Objective function (negative log-likelihood) and 
-        # gradient for MRF maximum likelihood estimation
-        
-        # negative LL : [sum_{i in data} weights * potentials(i)] - [1/|data| log sum_{j in joint configs} exp(weights * potentials(j))]
-        # negative LL grad: [sum_{j in joint configs} P(j|weights) * potentials(j)] - [1/|data| sum_{i in data} potentials(i)]
-        #   intuitively, the gradient represents the discrepancy between the potentials we would expect given the parameters, 
-        #       and the potentials we saw in the data
+        """
+            Computes the objective function (negative log-likelihood) and 
+            its gradient for MRF maximum likelihood estimation. 
+        """
 
         npoints = len(dmap.itervalues().next())
         if data_potentials is None:
@@ -181,6 +178,10 @@ class LogLinearMarkovNetwork(object):
         return (np.sum(npoints * partition) - np.sum(numerator), grad)
 
     def fit_mle(self, dmap, initweights=None):
+        """
+            Fits the network parameters using maximum likelihood estimation.
+            This is infeasible for large systems and supports only discrete data.
+        """
         if not initweights:
             initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
         data_potentials = self.potentials(dmap)
@@ -199,6 +200,12 @@ class LogLinearMarkovNetwork(object):
         return result
 
     def fit(self, dmap, initweights=None):
+        """ 
+            Optimize with a maximum-pseudo-likelihood objective 
+
+            Arguments:
+                dmap -- A dictionary mapping variable name to an array-like of observations for that variable
+        """
         if not initweights:
             initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
         data_potentials = self.potentials(dmap)
@@ -212,7 +219,17 @@ class LogLinearMarkovNetwork(object):
         return result
 
     def mple_local_partition_and_expected_potentials(self, dmap, vindex, weights, local_partition_potentials):
-        """ Creates the local pseudo-likelihood partition function for a given variable """
+        """ 
+            Creates the local pseudo-likelihood partition function for a given variable 
+
+            Arguments:
+                dmap -- A dictionary mapping variable name to an array-like of observations for that variable
+                vindex -- The index of the variable in self.variable_spec to compute the local partition for
+                weights -- Current parameters
+                local_partition_potentials -- Dictionary mapping variable name to A x P x D matrix of potential function values,
+                    where A is the number of assignments to that variable, P is the number of potential functions, and D is the number of data points.
+                    Entry (a, p, d) is the value of potential function p evaluated at data point d, with the key variable replaced with the assignment indexed by a.
+        """
         var = self.variable_spec[vindex]
         npoints = len(dmap.itervalues().next())
         mask = np.array(self.factor_adjacency[vindex, :].todense()).transpose()
@@ -232,6 +249,14 @@ class LogLinearMarkovNetwork(object):
             return (local_partition, expected_pots_given_params, all_densities)
 
     def get_local_partition_potentials(self, dmap):
+        """
+            Creates a dictionary mapping variable name to A x P x D matrix of potential function values,
+            where A is the number of assignments to that variable, P is the number of potential functions, and D is the number of data points.
+            Entry (a, p, d) is the value of potential function p evaluated at data point d, with the key variable replaced with the assignment indexed by a.
+
+            Arguments:
+                dmap -- A dictionary mapping variable name to array-like of observations for that variable
+        """
         npoints = len(dmap.itervalues().next())
 
         def calc_potentials(vindex, val):
@@ -248,8 +273,15 @@ class LogLinearMarkovNetwork(object):
         return local_partition_potentials
 
     def mple_objective_and_grad(self, dmap, weights, data_potentials=None, local_partition_potentials=None):
-        # Objective function (negative log-pseudo-likelihood) and gradient for 
-        # MRF maximum pseudo-likelihood estimation
+        """ 
+            Computes the negative log-pseudo-likelihood and its gradient
+
+            Arguments:
+                dmap -- A dictionary mapping variable name to array-like of observations for that variable
+                weights -- parameter assignments at which to perform the evaluation
+                data_potentials -- P x D matrix of potentials evaluated at each data point
+                local_partition_potentials -- Dictionary mapping variable name to A x P x D matrix of potential function values.
+        """
 
         npoints = len(dmap.itervalues().next())
 
@@ -281,6 +313,10 @@ class LogLinearMarkovNetwork(object):
         return (- (1.0 / npoints) * np.sum(ll_terms), np.sum(grad_terms, axis=0))
 
     def normalized_prob(self, dmap, weights=None):
+        """
+            Computes the normalized probability for a model involving only discrete variables.
+            This requires computation of the partition function and will be infeasible for large systems.
+        """
         if weights is None and self.weights is None:
             raise ValueError("The network parameters must be fit before computing probabilities")
         elif weights is None:
@@ -292,14 +328,28 @@ class LogLinearMarkovNetwork(object):
 
         return np.exp(np.dot(weights, data_potentials)) / np.exp(np.dot(weights, all_potentials)).sum()
 
-    def unnormalized_prob(self, dmap, weights):
+    def unnormalized_prob(self, dmap, weights=None):
+        """ 
+            Computes the numerator of the model's joint probability for each point in dmap.
+            This is proportional to the true probability.
+        """
         if weights is None and self.weights is None:
             raise ValueError("The network parameters must be fit before computing probabilities")
+        elif weights is None:
+            weights = self.weights
 
         data_potentials = self.potentials(dmap)
         return np.exp(np.dot(weights, data_potentials))
 
     def gibbs_sample(self, last_state, weights=None):
+        """
+            Samples new states for each variable in the system, conditioned on the last states.
+            Returns a dictionary mapping variable names to an array-like of states.
+            The length of the values of the output dictionary matches the length of the values of `last_state`.
+
+            Arguments:
+                last_state -- A dictionary mapping variable name to an array-like of states to project forward from.
+        """
         if weights is None and self.weights is None:
             raise ValueError("The network parameters must be fit before running Gibbs sampling")
         elif weights is None:
@@ -326,6 +376,11 @@ class LogLinearMarkovNetwork(object):
         return next_state
 
     def pseudonormalized_prob(self, dmap, weights=None):
+        """
+            Computes an approximate probability mass/density for each configuration in 
+            `dmap` using the pseudo-probability approximation. 
+            Unlike `normalized_prob`, this is computationally feasible for large systems but could be much less accurate.
+        """
         if weights is None and self.weights is None:
             raise ValueError("The network parameters must be fit before computing pseudo-probabilities")
         elif weights is None:
@@ -346,6 +401,7 @@ class LogLinearMarkovNetwork(object):
         return np.exp(probs)
 
     def potentials(self, dmap):
+        """ Computes the values of the potential functions for each data point in `dmap` """
         return np.array([f(dmap) for f in self.potential_funs])
 
     def expand_joint(self, variable_spec):
