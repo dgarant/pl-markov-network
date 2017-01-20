@@ -96,7 +96,7 @@ class BinaryProductPotential(PotentialFunction):
             return ((vals1 - 1) + vals1) * ((vals2 - 1) + vals2)
 
 class KernelDensityPotential(PotentialFunction):
-    def __init__(self, variables, samples):
+    def __init__(self, variables, samples, num_int_points=50):
         """
             Creates the kernel density estimate potential function
             
@@ -111,6 +111,7 @@ class KernelDensityPotential(PotentialFunction):
             raise ValueError("The binary product potential function does not support {0}-cliques.".format(len(self.var_list)))
         data = np.array([samples[v] for v in self.var_list])
         self.kde = stats.gaussian_kde(data.flatten() if len(self.var_list) == 1 else data)
+        self.num_int_points = num_int_points
 
     def variables(self):
         return self.var_list
@@ -121,14 +122,15 @@ class KernelDensityPotential(PotentialFunction):
         return self.kde(data.flatten() if len(self.var_list) == 1 else data)
 
 class VariableDef(object):
-    def __init__(self, name, ddomain=None, samples=None):
+    def __init__(self, name, ddomain=None, samples=None, num_int_points=50):
         self.name = name
         self.ddomain = ddomain
+        self.num_int_points = num_int_points
         if ddomain is None and samples is None:
             raise ValueError("For discrete data, you should supply 'ddomain'. " + 
                 "For continuous data, you should supply 'samples'.")
         if not samples is None:
-            self.int_points = stats.mstats.mquantiles(samples, np.linspace(0, 1, 50))
+            self.int_points = stats.mstats.mquantiles(samples, np.linspace(0, 1, self.num_int_points))
 
 class LogLinearMarkovNetwork(object):
     
@@ -146,12 +148,22 @@ class LogLinearMarkovNetwork(object):
         varname_to_index = dict((v.name, i) for i, v in enumerate(self.variable_spec))
         adj_rows = []
         adj_cols = []
+        adj_var_rows = []
+        adj_var_cols = []
+        saw_vars = set()
         for i, f in enumerate(self.potential_funs):
             for v in f.variables():
                 adj_rows.append(varname_to_index[v])
                 adj_cols.append(i)
+                for v2 in f.variables():
+                    if (v, v2) in saw_vars:
+                        continue
+                    adj_var_rows.append(varname_to_index[v])
+                    adj_var_cols.append(varname_to_index[v2])
+                    saw_vars.add((v, v2))
 
         self.factor_adjacency = spsparse.csr_matrix((np.repeat(1, len(adj_rows)), (adj_rows, adj_cols)))
+        self.var_adjacency = spsparse.csr_matrix((np.repeat(1, len(adj_var_rows)), (adj_var_rows, adj_var_cols)))
 
     def mle_objective_and_grad(self, dmap, weights, data_potentials=None, all_potentials=None):
         """
@@ -199,7 +211,7 @@ class LogLinearMarkovNetwork(object):
         self.weights = result.x
         return result
 
-    def fit(self, dmap, initweights=None):
+    def fit(self, dmap, initweights=None, log=False):
         """ 
             Optimize with a maximum-pseudo-likelihood objective 
 
@@ -208,13 +220,28 @@ class LogLinearMarkovNetwork(object):
         """
         if not initweights:
             initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
+        if log:
+            print("Computing potential functions ...")
         data_potentials = self.potentials(dmap)
         local_pots = self.get_local_partition_potentials(dmap)
 
+        if log:
+            def callback(weights):
+                print("|weights| = {0}".format(np.linalg.norm(weights)))
+        else:
+            callback = lambda weights: None
+
+        if log:
+            print("Beginning optimization ...")
+
+        # for big problems, don't use BFGS because this needs the Hessian
         result = spoptim.minimize(lambda weights: 
             self.mple_objective_and_grad(dmap, weights, 
                 data_potentials=data_potentials, 
-                local_partition_potentials=local_pots), initweights, jac=True)
+                local_partition_potentials=local_pots), 
+                initweights,
+                method="BFGS" if len(self.variable_spec) < 500 else "CG", 
+                jac=True, callback=callback)
         self.weights = result.x
         return result
 
@@ -226,15 +253,13 @@ class LogLinearMarkovNetwork(object):
                 dmap -- A dictionary mapping variable name to an array-like of observations for that variable
                 vindex -- The index of the variable in self.variable_spec to compute the local partition for
                 weights -- Current parameters
-                local_partition_potentials -- Dictionary mapping variable name to A x P x D matrix of potential function values,
-                    where A is the number of assignments to that variable, P is the number of potential functions, and D is the number of data points.
-                    Entry (a, p, d) is the value of potential function p evaluated at data point d, with the key variable replaced with the assignment indexed by a.
+                local_partition_potentials -- Output of `get_local_partition_potentials`
         """
         var = self.variable_spec[vindex]
         npoints = len(dmap.itervalues().next())
-        mask = np.array(self.factor_adjacency[vindex, :].todense()).transpose()
+        mask = self.factor_adjacency[vindex, :].nonzero()[1]
         all_potentials = local_partition_potentials[var.name]
-        weighted_potentials = np.dot(weights, np.multiply(mask, all_potentials))
+        weighted_potentials = np.dot(weights[mask], all_potentials)
 
         if not var.ddomain is None: # discrete
             all_probs = np.divide(np.exp(weighted_potentials), np.sum(np.exp(weighted_potentials), axis=0))
@@ -250,26 +275,32 @@ class LogLinearMarkovNetwork(object):
 
     def get_local_partition_potentials(self, dmap):
         """
-            Creates a dictionary mapping variable name to A x P x D matrix of potential function values,
-            where A is the number of assignments to that variable, P is the number of potential functions, and D is the number of data points.
-            Entry (a, p, d) is the value of potential function p evaluated at data point d, with the key variable replaced with the assignment indexed by a.
+            Creates a dictionary mapping variable name to A x P x D matrix of potential function values, where:
+                - A is the number of assignments to that variable
+                - P is the number of potential functions adjacent to the reference variable, and 
+                - D is the number of data points.
+            Entry (a, p, d) is the value of potential function p evaluated at data point d, 
+            with the key variable replaced with the assignment indexed by a.
 
             Arguments:
                 dmap -- A dictionary mapping variable name to array-like of observations for that variable
         """
         npoints = len(dmap.itervalues().next())
 
-        def calc_potentials(vindex, val):
-            dmap_prime = dict([(v.name, dmap[v.name]) 
-                if i != vindex else (v.name, np.repeat(val, npoints)) for i, v in enumerate(self.variable_spec)])
-            return self.potentials(dmap_prime)
+
+        def calc_potentials(vindex, val, factor_mask, var_mask):
+            dmap_prime = dict([(self.variable_spec[i].name, dmap[self.variable_spec[i].name]) 
+                if i != vindex else (self.variable_spec[i].name, np.repeat(val, npoints)) for i  in var_mask])
+            return self.potentials(dmap_prime, factor_mask)
 
         local_partition_potentials = dict()
         for vindex, v in enumerate(self.variable_spec):
+            factor_mask = self.factor_adjacency[vindex, :].nonzero()[1]
+            var_mask = self.var_adjacency[vindex, :].nonzero()[1]
             if not v.ddomain is None:
-                local_partition_potentials[v.name] = np.array([calc_potentials(vindex, val) for val in v.ddomain])
+                local_partition_potentials[v.name] = np.array([calc_potentials(vindex, val, factor_mask, var_mask) for val in v.ddomain])
             else:
-                local_partition_potentials[v.name] = np.array([calc_potentials(vindex, val) for val in v.int_points])
+                local_partition_potentials[v.name] = np.array([calc_potentials(vindex, val, factor_mask, var_mask) for val in v.int_points])
         return local_partition_potentials
 
     def mple_objective_and_grad(self, dmap, weights, data_potentials=None, local_partition_potentials=None):
@@ -290,27 +321,24 @@ class LogLinearMarkovNetwork(object):
         if local_partition_potentials is None:
             local_partition_potentials = self.get_local_partition_potentials(dmap)
 
-        ll_terms = []
-        grad_terms = []
+        ll_terms = np.zeros((len(self.variable_spec), npoints))
+        gradient = np.zeros(len(weights))
         observed_pots_expectation = np.mean(data_potentials, axis=1)
         for vindex, var in enumerate(self.variable_spec):
-            mask = np.array(self.factor_adjacency[vindex, :].todense()).transpose()
-            masked_dpots = np.multiply(mask, data_potentials)
-            data_term = np.dot(weights, masked_dpots)
+            mask = self.factor_adjacency[vindex, :].nonzero()[1]
+            masked_dpots = data_potentials[mask, :]
+            data_term = np.dot(weights[mask], masked_dpots)
 
             local_partition, expected_pots_given_params, _ = self.mple_local_partition_and_expected_potentials(
                 dmap, vindex, weights, local_partition_potentials)
-            assert(expected_pots_given_params.shape == (len(weights), npoints))
+            assert(expected_pots_given_params.shape == (len(mask), npoints))
 
-            ll_terms.append(data_term - local_partition)
+            ll_terms += (data_term - local_partition)
             # take mean across data points
-            gradient = np.mean(expected_pots_given_params - observed_pots_expectation[:, np.newaxis], axis=1)
-            grad_terms.append(gradient)
+            cur_gradient = np.mean(expected_pots_given_params - observed_pots_expectation[mask, np.newaxis], axis=1)
+            gradient[mask] = gradient[mask] + cur_gradient
 
-        assert(np.array(ll_terms).shape == (len(self.variable_spec), npoints))
-        assert(np.array(grad_terms).shape == (len(self.variable_spec), len(weights)))
-
-        return (- (1.0 / npoints) * np.sum(ll_terms), np.sum(grad_terms, axis=0))
+        return (- (1.0 / npoints) * np.sum(ll_terms), gradient)
 
     def normalized_prob(self, dmap, weights=None):
         """
@@ -400,9 +428,12 @@ class LogLinearMarkovNetwork(object):
 
         return np.exp(probs)
 
-    def potentials(self, dmap):
+    def potentials(self, dmap, mask=None):
         """ Computes the values of the potential functions for each data point in `dmap` """
-        return np.array([f(dmap) for f in self.potential_funs])
+        if mask is None:
+            return np.array([f(dmap) for f in self.potential_funs])
+        else:
+            return np.array([self.potential_funs[i](dmap) for i in mask])
 
     def expand_joint(self, variable_spec):
         """ Creates a data map which specifies the joint assignments of all variables """
