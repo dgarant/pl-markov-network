@@ -41,17 +41,20 @@ for vindex in range(nvars):
     var_defs.append(VariableDef(varname, samples=samples, num_int_points=10))
 
 potentials = []
+tied_params = [[], []]
 for vindex in range(nvars):
     varname = "x{0}".format(vindex)
     next_var = "x{0}".format((vindex+1) % nvars)
     potentials.append(GaussianPotential([varname], samples=data, location=0))
     potentials.append(GaussianPotential([varname, next_var], samples=data))
+    tied_params[0].append(len(potentials)-2)
+    tied_params[1].append(len(potentials)-1)
 
 for p in potentials:
     if p.bandwidth < 1e-16:
         print(p)
 
-network = LogLinearMarkovNetwork(potentials, var_defs)
+network = LogLinearMarkovNetwork(potentials, var_defs, tied_weights=tied_params)
 
 print("Fitting parameters ...")
 start = time.time()

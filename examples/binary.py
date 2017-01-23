@@ -34,7 +34,7 @@ data = {
     "y2" : y2,
 }
 
-network = LogLinearMarkovNetwork(potentials, var_defs)
+network = LogLinearMarkovNetwork(potentials, var_defs, tied_weights=[[0, 1], [3, 4]])
 
 all_combos = network.expand_joint(var_defs)
 x1p, x2p, y1p, y2p = (all_combos["x1"], all_combos["x2"], all_combos["y1"], all_combos["y2"])

@@ -1,4 +1,5 @@
 import sys
+from collections import defaultdict
 import numpy as np
 import scipy as sp
 from scipy import misc as spmisc
@@ -134,15 +135,47 @@ class VariableDef(object):
 
 class LogLinearMarkovNetwork(object):
     
-    def __init__(self, potential_funs, variable_spec):
+    def __init__(self, potential_funs, variable_spec, tied_weights=None, ncores=1):
         """
             Arguments:
                 potential_funs: A sequence of PotentialFunction instances
                 variable_spec: A sequence of VariableDef instances
+                tied_weights: A sequence of sets of integer indices.
+                    Each index set specifies a group of potential functions which have tied weights.
         """
         self.potential_funs = potential_funs
         self.variable_spec = variable_spec
+        self.ncores = ncores
         
+        if tied_weights:
+            self.has_tied_weights = True
+
+            # index tied weights for fast lookup
+            tied_ptr = dict()
+            self.inv_weights_map = defaultdict(list)
+            for group in tied_weights:
+                mgroup = min(group)
+                for i in group:
+                    tied_ptr[i] = mgroup
+                    self.inv_weights_map[mgroup].append(i)
+            
+            self.weights_map = dict()
+            self.tied = dict()
+            contracted_idx_ctr = 0
+            for i in range(len(self.potential_funs)):
+                if i in tied_ptr and tied_ptr[i] != i:
+                    self.tied[i] = True
+                    self.weights_map[i] = self.weights_map[tied_ptr[i]]
+                else:
+                    self.tied[i] = False
+                    self.weights_map[i] = contracted_idx_ctr
+                    contracted_idx_ctr += 1
+
+            self.n_contracted_weights = contracted_idx_ctr
+        else:
+            self.has_tied_weights = False
+            self.n_contracted_weights = len(self.potential_funs)
+
         # cosntructing a V x F sparse adjacency matrix where V 
         # is the number of variables and F is the number of factors
         varname_to_index = dict((v.name, i) for i, v in enumerate(self.variable_spec))
@@ -165,12 +198,43 @@ class LogLinearMarkovNetwork(object):
         self.factor_adjacency = spsparse.csr_matrix((np.repeat(1, len(adj_rows)), (adj_rows, adj_cols)))
         self.var_adjacency = spsparse.csr_matrix((np.repeat(1, len(adj_var_rows)), (adj_var_rows, adj_var_cols)))
 
+    def __expand_weights(self, weights):
+        """
+            Expands a compact vector of tied feature weights into a vector of the same length as `self.potential_funs`
+        """
+        if not self.has_tied_weights:
+            return weights
+
+        n_expanded = len(self.potential_funs)
+        expanded_weights = np.zeros(n_expanded)
+        for i in range(n_expanded):
+            expanded_weights[i] = weights[self.weights_map[i]]
+
+        return expanded_weights
+    
+    def __contract_gradient(self, expanded_grad):
+        """
+            Contracts a gradient vector of length `self.potential_funs` into tied-weight form
+        """
+        if not self.has_tied_weights:
+            return expanded_grad
+
+        contracted_grad = []
+        for i in range(len(expanded_grad)):
+            if i in self.inv_weights_map:
+                contracted_grad.append(np.mean(expanded_grad[self.inv_weights_map[i]]))
+            elif not self.tied[i]:
+                contracted_grad.append(expanded_grad[i])
+
+        return np.array(contracted_grad)
+
     def mle_objective_and_grad(self, dmap, weights, data_potentials=None, all_potentials=None):
         """
             Computes the objective function (negative log-likelihood) and 
             its gradient for MRF maximum likelihood estimation. 
         """
 
+        weights = self.__expand_weights(weights)
         npoints = len(dmap.itervalues().next())
         if data_potentials is None:
             data_potentials = self.potentials(dmap)
@@ -187,7 +251,8 @@ class LogLinearMarkovNetwork(object):
         grad = (np.sum(np.exp(pterms) / np.exp(pterms).sum() * all_potentials, axis=1) - 
                 np.sum((1.0 / npoints) * data_potentials, axis=1))
 
-        return (np.sum(npoints * partition) - np.sum(numerator), grad)
+        grad_contracted = self.__contract_gradient(grad)
+        return (np.sum(npoints * partition) - np.sum(numerator), grad_contracted)
 
     def fit_mle(self, dmap, initweights=None):
         """
@@ -195,7 +260,7 @@ class LogLinearMarkovNetwork(object):
             This is infeasible for large systems and supports only discrete data.
         """
         if not initweights:
-            initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
+            initweights = np.random.uniform(0, 1.0, self.n_contracted_weights)
         data_potentials = self.potentials(dmap)
         # make sure the data's all discrete
         for v in self.variable_spec:
@@ -209,6 +274,7 @@ class LogLinearMarkovNetwork(object):
             self.mle_objective_and_grad(dmap, weights, 
                 data_potentials=data_potentials, all_potentials=all_potentials), initweights, jac=True)
         self.weights = result.x
+        self.eweights = self.__expand_weights(result.x)
         return result
 
     def fit(self, dmap, initweights=None, log=False):
@@ -219,7 +285,7 @@ class LogLinearMarkovNetwork(object):
                 dmap -- A dictionary mapping variable name to an array-like of observations for that variable
         """
         if not initweights:
-            initweights = np.random.uniform(0, 1.0, len(self.potential_funs))
+            initweights = np.random.uniform(0, 1.0, self.n_contracted_weights)
         if log:
             print("Computing potential functions ...")
         data_potentials = self.potentials(dmap)
@@ -243,6 +309,7 @@ class LogLinearMarkovNetwork(object):
                 method="BFGS" if len(self.variable_spec) < 500 else "CG", 
                 jac=True, callback=callback)
         self.weights = result.x
+        self.eweights = self.__expand_weights(result.x)
         return result
 
     def mple_local_partition_and_expected_potentials(self, dmap, vindex, weights, local_partition_potentials):
@@ -262,7 +329,7 @@ class LogLinearMarkovNetwork(object):
         weighted_potentials = np.dot(weights[mask], all_potentials)
 
         if not var.ddomain is None: # discrete
-            all_probs = np.exp(weighted_potentials - np.logsumexp(weighted_potentials, axis=0))
+            all_probs = np.exp(weighted_potentials - sp.misc.logsumexp(weighted_potentials, axis=0))
             local_partition = spmisc.logsumexp(weighted_potentials, axis=0)
             expected_pots_given_params = np.sum(np.multiply(all_probs[:, np.newaxis, :], all_potentials), axis=0)
             return (local_partition, expected_pots_given_params, all_probs)
@@ -286,7 +353,6 @@ class LogLinearMarkovNetwork(object):
                 dmap -- A dictionary mapping variable name to array-like of observations for that variable
         """
         npoints = len(dmap.itervalues().next())
-
 
         def calc_potentials(vindex, val, factor_mask, var_mask):
             dmap_prime = dict([(self.variable_spec[i].name, dmap[self.variable_spec[i].name]) 
@@ -314,6 +380,7 @@ class LogLinearMarkovNetwork(object):
                 local_partition_potentials -- Dictionary mapping variable name to A x P x D matrix of potential function values.
         """
 
+        weights = self.__expand_weights(weights)
         npoints = len(dmap.itervalues().next())
 
         if data_potentials is None:
@@ -338,17 +405,18 @@ class LogLinearMarkovNetwork(object):
             cur_gradient = np.mean(expected_pots_given_params - observed_pots_expectation[mask, np.newaxis], axis=1)
             gradient[mask] = gradient[mask] + cur_gradient
 
-        return (- (1.0 / npoints) * np.sum(ll_terms), gradient)
+        gradient_contract = self.__contract_gradient(gradient)
+        return (- (1.0 / npoints) * np.sum(ll_terms), gradient_contract)
 
     def normalized_prob(self, dmap, weights=None):
         """
             Computes the normalized probability for a model involving only discrete variables.
             This requires computation of the partition function and will be infeasible for large systems.
         """
-        if weights is None and self.weights is None:
+        if weights is None and self.eweights is None:
             raise ValueError("The network parameters must be fit before computing probabilities")
         elif weights is None:
-            weights = self.weights
+            weights = self.eweights
 
         data_potentials = self.potentials(dmap)
         all_combos =  self.expand_joint(self.variable_spec)
@@ -361,10 +429,10 @@ class LogLinearMarkovNetwork(object):
             Computes the numerator of the model's joint probability for each point in dmap.
             This is proportional to the true probability.
         """
-        if weights is None and self.weights is None:
+        if weights is None and self.eweights is None:
             raise ValueError("The network parameters must be fit before computing probabilities")
         elif weights is None:
-            weights = self.weights
+            weights = self.eweights
 
         data_potentials = self.potentials(dmap)
         return np.exp(np.dot(weights, data_potentials))
@@ -378,10 +446,10 @@ class LogLinearMarkovNetwork(object):
             Arguments:
                 last_state -- A dictionary mapping variable name to an array-like of states to project forward from.
         """
-        if weights is None and self.weights is None:
+        if weights is None and self.eweights is None:
             raise ValueError("The network parameters must be fit before running Gibbs sampling")
         elif weights is None:
-            weights = self.weights
+            weights = self.eweights
 
         all_potentials = self.get_local_partition_potentials(last_state)
 
@@ -409,10 +477,10 @@ class LogLinearMarkovNetwork(object):
             `dmap` using the pseudo-probability approximation. 
             Unlike `normalized_prob`, this is computationally feasible for large systems but could be much less accurate.
         """
-        if weights is None and self.weights is None:
+        if weights is None and self.eweights is None:
             raise ValueError("The network parameters must be fit before computing pseudo-probabilities")
         elif weights is None:
-            weights = self.weights
+            weights = self.eweights
 
         local_partition_potentials = self.get_local_partition_potentials(dmap)
 
