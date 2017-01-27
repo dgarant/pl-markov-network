@@ -135,7 +135,7 @@ class VariableDef(object):
 
 class LogLinearMarkovNetwork(object):
     
-    def __init__(self, potential_funs, variable_spec, tied_weights=None, ncores=1):
+    def __init__(self, potential_funs, variable_spec, tied_weights=None):
         """
             Arguments:
                 potential_funs: A sequence of PotentialFunction instances
@@ -145,7 +145,6 @@ class LogLinearMarkovNetwork(object):
         """
         self.potential_funs = potential_funs
         self.variable_spec = variable_spec
-        self.ncores = ncores
         
         if tied_weights:
             self.has_tied_weights = True
