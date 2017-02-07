@@ -5,7 +5,7 @@ try:
 except ImportError:
     from distutils.core import setup
 
-import mrf
+import plmrf
 
 setup(name='plmrf',
       version='1.0',
