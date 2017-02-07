@@ -61,9 +61,9 @@ class GaussianPotential(PotentialFunction):
     
     def __call__(self, dmap):
         if len(self.var_list) == 1:
-            return np.exp(-np.abs(dmap[self.var_list[0]] - self.location) / self.bandwidth)
+            return np.exp(-np.power(dmap[self.var_list[0]] - self.location, 2) / self.bandwidth)
         else:
-            return np.exp(-np.abs(dmap[self.var_list[0]] - dmap[self.var_list[1]]) / self.bandwidth)
+            return np.exp(-np.power(dmap[self.var_list[0]] - dmap[self.var_list[1]], 2) / self.bandwidth)
 
 class IdentityPotential(PotentialFunction):
     def __init__(self, variables):
@@ -135,7 +135,7 @@ class VariableDef(object):
 
 class LogLinearMarkovNetwork(object):
     
-    def __init__(self, potential_funs, variable_spec, tied_weights=None):
+    def __init__(self, potential_funs, variable_spec, tied_weights=None, parallelism=1):
         """
             Arguments:
                 potential_funs: A sequence of PotentialFunction instances
@@ -145,6 +145,11 @@ class LogLinearMarkovNetwork(object):
         """
         self.potential_funs = potential_funs
         self.variable_spec = variable_spec
+        self.parallelism = parallelism 
+
+        if self.parallelism > 1 and len(self.variable_spec) > 100:
+            import pathos
+            self.processing_pool = pathos.multiprocessing.ProcessingPool(self.parallelism)
         
         if tied_weights:
             self.has_tied_weights = True
@@ -387,25 +392,46 @@ class LogLinearMarkovNetwork(object):
         if local_partition_potentials is None:
             local_partition_potentials = self.get_local_partition_potentials(dmap)
 
-        ll_terms = np.zeros((len(self.variable_spec), npoints))
-        gradient = np.zeros(len(weights))
-        observed_pots_expectation = np.mean(data_potentials, axis=1)
-        for vindex, var in enumerate(self.variable_spec):
-            mask = self.factor_adjacency[vindex, :].nonzero()[1]
-            masked_dpots = data_potentials[mask, :]
-            data_term = np.dot(weights[mask], masked_dpots)
+        def compute_subset(var_indices):
+            ll_terms = np.zeros((len(self.variable_spec), npoints))
+            gradient = np.zeros(len(weights))
+            observed_pots_expectation = np.mean(data_potentials, axis=1)
+            for vindex, var in enumerate(self.variable_spec):
+                if not vindex in var_indices:
+                    continue
 
-            local_partition, expected_pots_given_params, _ = self.mple_local_partition_and_expected_potentials(
-                dmap, vindex, weights, local_partition_potentials)
-            assert(expected_pots_given_params.shape == (len(mask), npoints))
+                mask = self.factor_adjacency[vindex, :].nonzero()[1]
+                masked_dpots = data_potentials[mask, :]
+                data_term = np.dot(weights[mask], masked_dpots)
 
-            ll_terms += (data_term - local_partition)
-            # take mean across data points
-            cur_gradient = np.mean(expected_pots_given_params - observed_pots_expectation[mask, np.newaxis], axis=1)
-            gradient[mask] = gradient[mask] + cur_gradient
+                local_partition, expected_pots_given_params, _ = self.mple_local_partition_and_expected_potentials(
+                    dmap, vindex, weights, local_partition_potentials)
+                assert(expected_pots_given_params.shape == (len(mask), npoints))
+
+                ll_terms += (data_term - local_partition)
+                # take mean across data points
+                cur_gradient = np.mean(expected_pots_given_params - observed_pots_expectation[mask, np.newaxis], axis=1)
+                gradient[mask] = gradient[mask] + cur_gradient
+
+            return (ll_terms, gradient)
+        
+        if self.parallelism > 1:
+            nvars = len(self.variable_spec)
+            step = int(nvars/self.parallelism)
+            partitions = [range(i, max(i+step, nvars)) for i in xrange(0, nvars, step)]
+            local_terms = self.processing_pool.map(compute_subset, partitions)
+            ll_terms = [v[0] for v in local_terms]
+            gradient = np.sum([v[1] for v in local_terms], axis=0)
+        else:
+            ll_terms, gradient = compute_subset(xrange(len(self.variable_spec)))
 
         gradient_contract = self.__contract_gradient(gradient)
         return (- (1.0 / npoints) * np.sum(ll_terms), gradient_contract)
+
+    def __getstate__(self):
+        self_dict = self.__dict__.copy()
+        del self_dict['processing_pool']
+        return self_dict
 
     def normalized_prob(self, dmap, weights=None):
         """
