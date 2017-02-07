@@ -65,6 +65,12 @@ class GaussianPotential(PotentialFunction):
         else:
             return np.exp(-np.power(dmap[self.var_list[0]] - dmap[self.var_list[1]], 2) / self.bandwidth)
 
+    def __repr__(self):
+        return str(self)
+
+    def __str__(self):
+        return "GaussianPotential({0}, {1})".format("; ".join(self.var_list), self.bandwidth)
+
 class IdentityPotential(PotentialFunction):
     def __init__(self, variables):
         self.var_list = list(variables)
@@ -132,6 +138,11 @@ class VariableDef(object):
                 "For continuous data, you should supply 'samples'.")
         if not samples is None:
             self.int_points = stats.mstats.mquantiles(samples, np.linspace(0, 1, self.num_int_points))
+    def __repr__(self):
+        return str(self)
+
+    def __str__(self):
+        return str((self.name, "continuous" if self.ddomain is None else "discrete"))
 
 class LogLinearMarkovNetwork(object):
     
