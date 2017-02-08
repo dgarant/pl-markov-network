@@ -146,22 +146,20 @@ class VariableDef(object):
 
 class LogLinearMarkovNetwork(object):
     
-    def __init__(self, potential_funs, variable_spec, tied_weights=None, parallelism=1):
+    def __init__(self, potential_funs, variable_spec, tied_weights=None, conditioned=None):
         """
             Arguments:
                 potential_funs: A sequence of PotentialFunction instances
                 variable_spec: A sequence of VariableDef instances
                 tied_weights: A sequence of sets of integer indices.
                     Each index set specifies a group of potential functions which have tied weights.
+                conditioned: Optional, a dictionary mapping variable name to a 
+                             set of 'observable' variables (as in a CRF) which are adjacent to that variable.
+                             The observable variables do not need to be included in variable_spec.
         """
         self.potential_funs = potential_funs
         self.variable_spec = variable_spec
-        self.parallelism = parallelism 
 
-        if self.parallelism > 1 and len(self.variable_spec) > 100:
-            import pathos
-            self.processing_pool = pathos.multiprocessing.ProcessingPool(self.parallelism)
-        
         if tied_weights:
             self.has_tied_weights = True
 
@@ -191,6 +189,13 @@ class LogLinearMarkovNetwork(object):
             self.has_tied_weights = False
             self.n_contracted_weights = len(self.potential_funs)
 
+        self.conditioned = conditioned
+        if not self.conditioned:
+            self.conditioned = defaultdict(list)
+        self.conditioned_vars = set([v for l in self.conditioned.values() for v in l])
+
+        self.__validate_variable_spec()
+
         # cosntructing a V x F sparse adjacency matrix where V 
         # is the number of variables and F is the number of factors
         varname_to_index = dict((v.name, i) for i, v in enumerate(self.variable_spec))
@@ -201,17 +206,43 @@ class LogLinearMarkovNetwork(object):
         saw_vars = set()
         for i, f in enumerate(self.potential_funs):
             for v in f.variables():
-                adj_rows.append(varname_to_index[v])
-                adj_cols.append(i)
-                for v2 in f.variables():
-                    if (v, v2) in saw_vars:
-                        continue
-                    adj_var_rows.append(varname_to_index[v])
-                    adj_var_cols.append(varname_to_index[v2])
-                    saw_vars.add((v, v2))
+                if v in varname_to_index: # could be in conditioned
+                    adj_rows.append(varname_to_index[v])
+                    adj_cols.append(i)
+                    for v2 in f.variables():
+                        if (v, v2) in saw_vars or not v2 in varname_to_index:
+                            continue
+                        adj_var_rows.append(varname_to_index[v])
+                        adj_var_cols.append(varname_to_index[v2])
+                        saw_vars.add((v, v2))
 
         self.factor_adjacency = spsparse.csr_matrix((np.repeat(1, len(adj_rows)), (adj_rows, adj_cols)))
         self.var_adjacency = spsparse.csr_matrix((np.repeat(1, len(adj_var_rows)), (adj_var_rows, adj_var_cols)))
+
+    def __validate_variable_spec(self):
+        var_names = set([v.name for v in self.variable_spec])
+        for i, f in enumerate(self.potential_funs):
+            factor_vars = set(f.variables())
+            if len(factor_vars) == 0:
+                raise ValueError("Potential function {0} contains no variables".format(i))
+
+            def_vars = var_names.intersection(factor_vars)
+            if len(def_vars) == 0:
+                raise ValueError("Potential function {0} contains only conditioned variables".format(i))
+
+            conditioned_vars = set([cvar for v in def_vars for cvar in self.conditioned[v]])
+            undef_vars = factor_vars.difference(def_vars).difference(conditioned_vars)
+
+            if len(undef_vars) > 0:
+                raise ValueError("Potential function {0} contains unrecognized variables: {1}".format(i, ",".join(undef_vars)))
+        
+        for k, v in self.conditioned.items():
+            vinter = set(v).intersection(var_names)
+            if len(vinter) > 0:
+                raise ValueError(("Observables {0} appear in the conditioning set for " + 
+                    "variable {1}, but are also specified as variables").format(",".join(vinter), k))
+            if not k in var_names:
+                raise ValueError("Variable {0} specified in `conditioned`, but is not specified as a variable".format(k))
 
     def __expand_weights(self, weights):
         """
@@ -254,7 +285,7 @@ class LogLinearMarkovNetwork(object):
         if data_potentials is None:
             data_potentials = self.potentials(dmap)
         if all_potentials is None:
-            all_combos =  self.expand_joint(self.variable_spec)
+            all_combos =  self.expand_joint()
             all_potentials = self.potentials(all_combos)
 
         varnames = [v.name for v in self.variable_spec]
@@ -281,8 +312,10 @@ class LogLinearMarkovNetwork(object):
         for v in self.variable_spec:
             if v.ddomain is None:
                 raise ValueError("Maximum likelihood estimation only supported for discrete data.")
+        if len(self.conditioned_vars) > 0:
+            raise ValueError("Maximum likelihood estimation for CRFs not yet supported.")
 
-        all_combos =  self.expand_joint(self.variable_spec)
+        all_combos =  self.expand_joint()
         all_potentials = self.potentials(all_combos)
 
         result = spoptim.minimize(lambda weights: 
@@ -370,8 +403,13 @@ class LogLinearMarkovNetwork(object):
         npoints = len(dmap.itervalues().next())
 
         def calc_potentials(vindex, val, factor_mask, var_mask):
-            dmap_prime = dict([(self.variable_spec[i].name, dmap[self.variable_spec[i].name]) 
-                if i != vindex else (self.variable_spec[i].name, np.repeat(val, npoints)) for i  in var_mask])
+            myname = self.variable_spec[vindex].name
+            adj_var_names = [self.variable_spec[i].name for i in var_mask] + self.conditioned[myname]
+            dmap_prime = dict()
+            for other_var in adj_var_names:
+                dmap_prime[other_var] = dmap[other_var]
+            dmap_prime[myname] = np.repeat(val, npoints)
+
             return self.potentials(dmap_prime, factor_mask)
 
         local_partition_potentials = dict()
@@ -403,38 +441,23 @@ class LogLinearMarkovNetwork(object):
         if local_partition_potentials is None:
             local_partition_potentials = self.get_local_partition_potentials(dmap)
 
-        def compute_subset(var_indices):
-            ll_terms = np.zeros((len(self.variable_spec), npoints))
-            gradient = np.zeros(len(weights))
-            observed_pots_expectation = np.mean(data_potentials, axis=1)
-            for vindex, var in enumerate(self.variable_spec):
-                if not vindex in var_indices:
-                    continue
+        ll_terms = np.zeros((len(self.variable_spec), npoints))
+        gradient = np.zeros(len(weights))
+        observed_pots_expectation = np.mean(data_potentials, axis=1)
+        for vindex, var in enumerate(self.variable_spec):
 
-                mask = self.factor_adjacency[vindex, :].nonzero()[1]
-                masked_dpots = data_potentials[mask, :]
-                data_term = np.dot(weights[mask], masked_dpots)
+            mask = self.factor_adjacency[vindex, :].nonzero()[1]
+            masked_dpots = data_potentials[mask, :]
+            data_term = np.dot(weights[mask], masked_dpots)
 
-                local_partition, expected_pots_given_params, _ = self.mple_local_partition_and_expected_potentials(
-                    dmap, vindex, weights, local_partition_potentials)
-                assert(expected_pots_given_params.shape == (len(mask), npoints))
+            local_partition, expected_pots_given_params, _ = self.mple_local_partition_and_expected_potentials(
+                dmap, vindex, weights, local_partition_potentials)
+            assert(expected_pots_given_params.shape == (len(mask), npoints))
 
-                ll_terms += (data_term - local_partition)
-                # take mean across data points
-                cur_gradient = np.mean(expected_pots_given_params - observed_pots_expectation[mask, np.newaxis], axis=1)
-                gradient[mask] = gradient[mask] + cur_gradient
-
-            return (ll_terms, gradient)
-        
-        if self.parallelism > 1:
-            nvars = len(self.variable_spec)
-            step = int(nvars/self.parallelism)
-            partitions = [range(i, max(i+step, nvars)) for i in xrange(0, nvars, step)]
-            local_terms = self.processing_pool.map(compute_subset, partitions)
-            ll_terms = [v[0] for v in local_terms]
-            gradient = np.sum([v[1] for v in local_terms], axis=0)
-        else:
-            ll_terms, gradient = compute_subset(xrange(len(self.variable_spec)))
+            ll_terms += (data_term - local_partition)
+            # take mean across data points
+            cur_gradient = np.mean(expected_pots_given_params - observed_pots_expectation[mask, np.newaxis], axis=1)
+            gradient[mask] = gradient[mask] + cur_gradient
 
         gradient_contract = self.__contract_gradient(gradient)
         return (- (1.0 / npoints) * np.sum(ll_terms), gradient_contract)
@@ -453,12 +476,25 @@ class LogLinearMarkovNetwork(object):
             raise ValueError("The network parameters must be fit before computing probabilities")
         elif weights is None:
             weights = self.eweights
-
+        
+        print(dmap)
         data_potentials = self.potentials(dmap)
-        all_combos =  self.expand_joint(self.variable_spec)
+        conditions = self.__extract_conditions(dmap)
+        self.__validate_conditions(conditions) 
+        all_combos =  self.expand_joint(conditions=conditions)
+        print(all_combos)
         all_potentials = self.potentials(all_combos)
 
         return np.exp(np.dot(weights, data_potentials)) / np.exp(np.dot(weights, all_potentials)).sum()
+
+    def __extract_conditions(self, dmap):
+        conditions = dict()
+        for v in self.conditioned_vars:
+            values = dmap[v]
+            if sp.var(values) > 0:
+                raise ValueError("Expected conditioning variable {0} to be constant at inference time".format(v))
+            conditions[v] = values[0]
+        return conditions
 
     def unnormalized_prob(self, dmap, weights=None):
         """ 
@@ -539,8 +575,27 @@ class LogLinearMarkovNetwork(object):
         else:
             return np.array([self.potential_funs[i](dmap) for i in mask])
 
-    def expand_joint(self, variable_spec):
-        """ Creates a data map which specifies the joint assignments of all variables """
-        grid = np.meshgrid(*(a.ddomain for a in variable_spec))
-        return dict([(variable_spec[i].name, e.flatten()) for i, e in enumerate(grid)])
+    def __validate_conditions(self, conditions):
+        if conditions is None and len(self.conditioned_vars) > 0:
+            raise ValueError("Conditioning set not supplied to CRF at inference time")
+
+        missing_vars = set(conditions.keys()).difference(self.conditioned_vars)
+        if len(missing_vars) > 0:
+            raise ValueError("Missing observation for conditioned variables: {0}".format(",".join(missing_vars)))
+    
+    def expand_joint(self, conditions=None):
+        """ 
+            Creates a data map which specifies the joint assignments of all variables 
+            Arguments:
+                conditions -- Maps each conditioning variable to a scalar value
+        """
+        self.__validate_conditions(conditions) 
+        grid = np.meshgrid(*(a.ddomain for a in self.variable_spec))
+        vgrid = dict([(self.variable_spec[i].name, e.flatten()) for i, e in enumerate(grid)])
+
+        npoints = len(next(vgrid.iteritems())[1])
+        for v in self.conditioned_vars:
+            vgrid[v] = np.repeat(conditions[v], npoints)
+
+        return vgrid
 
