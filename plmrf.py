@@ -462,11 +462,6 @@ class LogLinearMarkovNetwork(object):
         gradient_contract = self.__contract_gradient(gradient)
         return (- (1.0 / npoints) * np.sum(ll_terms), gradient_contract)
 
-    def __getstate__(self):
-        self_dict = self.__dict__.copy()
-        del self_dict['processing_pool']
-        return self_dict
-
     def normalized_prob(self, dmap, weights=None):
         """
             Computes the normalized probability for a model involving only discrete variables.
